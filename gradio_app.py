@@ -184,6 +184,9 @@ groundingdino_model = None
 sam_predictor = None
 sam_automask_generator = None
 inpaint_pipeline = None
+blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large",
+                                                                        torch_dtype=torch.float16).to("cuda")
 
 def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_threshold, text_threshold, iou_threshold, inpaint_mode, scribble_mode, openai_api_key):
 
@@ -247,11 +250,11 @@ def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_th
             # use Tag2Text can generate better captions
             # https://huggingface.co/spaces/xinyu1205/Tag2Text
             # but there are some bugs...
-            blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-            blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
-            text_prompt = generate_caption(blip_processor, blip_model, image_pil)
-            if len(openai_api_key) > 0:
-                text_prompt = generate_tags(text_prompt, split=",", openai_api_key=openai_api_key)
+
+            if not text_prompt:
+                text_prompt = generate_caption(blip_processor, blip_model, image_pil)
+                if len(openai_api_key) > 0:
+                    text_prompt = generate_tags(text_prompt, split=",", openai_api_key=openai_api_key)
             print(f"Caption: {text_prompt}")
 
         # run grounding dino model
@@ -280,8 +283,10 @@ def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_th
                 pred_phrases = [pred_phrases[idx] for idx in nms_idx]
                 print(f"After NMS: {boxes_filt.shape[0]} boxes")
                 print(f"Revise caption with number: {text_prompt}")
+                print(f'pred_phrases:{pred_phrases}')
 
             transformed_boxes = sam_predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
+            print(f'-----transformed_boxes:{transformed_boxes}')
 
             masks, _, _ = sam_predictor.predict_torch(
                 point_coords = None,
