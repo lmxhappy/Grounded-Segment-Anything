@@ -1,34 +1,25 @@
+# coding:utf-8
+import argparse
 import os
 import random
-import cv2
-from scipy import ndimage
-
-import gradio as gr
-import argparse
-
-import numpy as np
-import torch
-import torchvision
-from PIL import Image, ImageDraw, ImageFont
 
 # Grounding DINO
 import GroundingDINO.groundingdino.datasets.transforms as T
+import gradio as gr
+import numpy as np
+import openai
+# diffusers
+import torch
+import torchvision
 from GroundingDINO.groundingdino.models import build_model
 from GroundingDINO.groundingdino.util.slconfig import SLConfig
 from GroundingDINO.groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
-
-# segment anything
-from segment_anything import build_sam, SamPredictor, SamAutomaticMaskGenerator
-import numpy as np
-
-# diffusers
-import torch
-from diffusers import StableDiffusionInpaintPipeline
-
+from PIL import Image, ImageDraw, ImageFont
 # BLIP
 from transformers import BlipProcessor, BlipForConditionalGeneration
 
-import openai
+# segment anything
+from segment_anything import build_sam, SamPredictor, SamAutomaticMaskGenerator
 
 
 def show_anns(anns):
@@ -116,7 +107,7 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold, w
         outputs = model(image[None], captions=[caption])
     logits = outputs["pred_logits"].cpu().sigmoid()[0]  # (nq, 256)
     boxes = outputs["pred_boxes"].cpu()[0]  # (nq, 4)
-    logits.shape[0]
+    # logits.shape[0]
 
     # filter output
     logits_filt = logits.clone()
@@ -124,7 +115,7 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold, w
     filt_mask = logits_filt.max(dim=1)[0] > box_threshold
     logits_filt = logits_filt[filt_mask]  # num_filt, 256
     boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
-    logits_filt.shape[0]
+    # logits_filt.shape[0]
 
     # get phrase
     tokenlizer = model.tokenizer
@@ -195,8 +186,7 @@ blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesfo
                                                                         torch_dtype=torch.float16).to("cuda")
 
 
-def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_threshold, text_threshold, iou_threshold,
-                     inpaint_mode, scribble_mode, openai_api_key):
+def run_grounded_sam(input_image, box_threshold, text_threshold, iou_threshold):
     global blip_processor, blip_model, groundingdino_model, sam_predictor, sam_automask_generator, inpaint_pipeline
 
     # make dir
@@ -220,148 +210,68 @@ def run_grounded_sam(input_image, text_prompt, task_type, inpaint_prompt, box_th
     image_pil = image.convert("RGB")
     image = np.array(image_pil)
 
-    if task_type == 'scribble':
-        sam_predictor.set_image(image)
-        scribble = scribble.convert("RGB")
-        scribble = np.array(scribble)
-        scribble = scribble.transpose(2, 1, 0)[0]
+    transformed_image = transform_image(image_pil)
 
-        # 将连通域进行标记
-        labeled_array, num_features = ndimage.label(scribble >= 255)
+    # generate caption and tags
+    # use Tag2Text can generate better captions
+    # https://huggingface.co/spaces/xinyu1205/Tag2Text
+    # but there are some bugs...
 
-        # 计算每个连通域的质心
-        centers = ndimage.center_of_mass(scribble, labeled_array, range(1, num_features + 1))
-        centers = np.array(centers)
+    text_prompt = generate_caption(blip_processor, blip_model, image_pil)
 
-        point_coords = torch.from_numpy(centers)
-        point_coords = sam_predictor.transform.apply_coords_torch(point_coords, image.shape[:2])
-        point_coords = point_coords.unsqueeze(0).to(device)
-        point_labels = torch.from_numpy(np.array([1] * len(centers))).unsqueeze(0).to(device)
-        if scribble_mode == 'split':
-            point_coords = point_coords.permute(1, 0, 2)
-            point_labels = point_labels.permute(1, 0)
-        masks, _, _ = sam_predictor.predict_torch(
-            point_coords=point_coords if len(point_coords) > 0 else None,
-            point_labels=point_labels if len(point_coords) > 0 else None,
-            mask_input=None,
-            boxes=None,
-            multimask_output=False,
-        )
-    elif task_type == 'automask':
-        masks = sam_automask_generator.generate(image)
-    else:
-        transformed_image = transform_image(image_pil)
+    print(f"Caption: {text_prompt}")
 
-        if task_type == 'automatic':
-            # generate caption and tags
-            # use Tag2Text can generate better captions
-            # https://huggingface.co/spaces/xinyu1205/Tag2Text
-            # but there are some bugs...
+    # run grounding dino model
+    boxes_filt, scores, pred_phrases = get_grounding_output(
+        groundingdino_model, transformed_image, text_prompt, box_threshold, text_threshold
+    )
 
-            if not text_prompt:
-                text_prompt = generate_caption(blip_processor, blip_model, image_pil)
-                if len(openai_api_key) > 0:
-                    text_prompt = generate_tags(text_prompt, split=",", openai_api_key=openai_api_key)
-            print(f"Caption: {text_prompt}")
+    # process boxes
+    H, W = size[1], size[0]
+    for i in range(boxes_filt.size(0)):
+        boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+        boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+        boxes_filt[i][2:] += boxes_filt[i][:2]
 
-        # run grounding dino model
-        boxes_filt, scores, pred_phrases = get_grounding_output(
-            groundingdino_model, transformed_image, text_prompt, box_threshold, text_threshold
-        )
+    boxes_filt = boxes_filt.cpu()
 
-        # process boxes
-        H, W = size[1], size[0]
-        for i in range(boxes_filt.size(0)):
-            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
-            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-            boxes_filt[i][2:] += boxes_filt[i][:2]
+    sam_predictor.set_image(image)
 
-        boxes_filt = boxes_filt.cpu()
+    # use NMS to handle overlapped boxes
+    print(f"Before NMS: {boxes_filt.shape[0]} boxes")
+    nms_idx = torchvision.ops.nms(boxes_filt, scores, iou_threshold).numpy().tolist()
+    boxes_filt = boxes_filt[nms_idx]
+    pred_phrases = [pred_phrases[idx] for idx in nms_idx]
+    print(f"After NMS: {boxes_filt.shape[0]} boxes")
+    print(f"Revise caption with number: {text_prompt}")
+    print(f'pred_phrases:{pred_phrases}')
 
-        if task_type == 'seg' or task_type == 'inpainting' or task_type == 'automatic':
-            sam_predictor.set_image(image)
+    transformed_boxes = sam_predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
+    print(f'-----transformed_boxes:{transformed_boxes}')
 
-            if task_type == 'automatic':
-                # use NMS to handle overlapped boxes
-                print(f"Before NMS: {boxes_filt.shape[0]} boxes")
-                nms_idx = torchvision.ops.nms(boxes_filt, scores, iou_threshold).numpy().tolist()
-                boxes_filt = boxes_filt[nms_idx]
-                pred_phrases = [pred_phrases[idx] for idx in nms_idx]
-                print(f"After NMS: {boxes_filt.shape[0]} boxes")
-                print(f"Revise caption with number: {text_prompt}")
-                print(f'pred_phrases:{pred_phrases}')
+    masks, _, _ = sam_predictor.predict_torch(
+        point_coords=None,
+        point_labels=None,
+        boxes=transformed_boxes,
+        multimask_output=False,
+    )
 
-            transformed_boxes = sam_predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
-            print(f'-----transformed_boxes:{transformed_boxes}')
+    mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
 
-            masks, _, _ = sam_predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False,
-            )
+    mask_draw = ImageDraw.Draw(mask_image)
+    for mask in masks:
+        draw_mask(mask[0].cpu().numpy(), mask_draw, random_color=True)
 
-    if task_type == 'det':
-        image_draw = ImageDraw.Draw(image_pil)
-        for box, label in zip(boxes_filt, pred_phrases):
-            draw_box(box, image_draw, label)
+    image_draw = ImageDraw.Draw(image_pil)
 
-        return [image_pil]
-    elif task_type == 'automask':
-        full_img, res = show_anns(masks)
-        return [full_img]
-    elif task_type == 'scribble':
-        mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
+    for box, label in zip(boxes_filt, pred_phrases):
+        draw_box(box, image_draw, label)
 
-        mask_draw = ImageDraw.Draw(mask_image)
+    image_draw.text((10, 10), text_prompt, fill='black')
 
-        for mask in masks:
-            draw_mask(mask[0].cpu().numpy(), mask_draw, random_color=True)
-
-        image_pil = image_pil.convert('RGBA')
-        image_pil.alpha_composite(mask_image)
-        return [image_pil, mask_image]
-    elif task_type == 'seg' or task_type == 'automatic':
-
-        mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
-
-        mask_draw = ImageDraw.Draw(mask_image)
-        for mask in masks:
-            draw_mask(mask[0].cpu().numpy(), mask_draw, random_color=True)
-
-        image_draw = ImageDraw.Draw(image_pil)
-
-        for box, label in zip(boxes_filt, pred_phrases):
-            draw_box(box, image_draw, label)
-
-        if task_type == 'automatic':
-            image_draw.text((10, 10), text_prompt, fill='black')
-
-        image_pil = image_pil.convert('RGBA')
-        image_pil.alpha_composite(mask_image)
-        return [image_pil, mask_image]
-    elif task_type == 'inpainting':
-        assert inpaint_prompt, 'inpaint_prompt is not found!'
-        # inpainting pipeline
-        if inpaint_mode == 'merge':
-            masks = torch.sum(masks, dim=0).unsqueeze(0)
-            masks = torch.where(masks > 0, True, False)
-        mask = masks[0][0].cpu().numpy()  # simply choose the first mask, which will be refine in the future release
-        mask_pil = Image.fromarray(mask)
-
-        if inpaint_pipeline is None:
-            inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-                "runwayml/stable-diffusion-inpainting", torch_dtype=torch.float16
-            )
-            inpaint_pipeline = inpaint_pipeline.to("cuda")
-
-        image = inpaint_pipeline(prompt=inpaint_prompt, image=image_pil.resize((512, 512)),
-                                 mask_image=mask_pil.resize((512, 512))).images[0]
-        image = image.resize(size)
-
-        return [image, mask_pil], "mytst"
-    else:
-        print("task_type:{} error!".format(task_type))
+    image_pil = image_pil.convert('RGBA')
+    image_pil.alpha_composite(mask_image)
+    return [image_pil, mask_image]
 
 
 if __name__ == "__main__":
@@ -382,10 +292,7 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column():
                 input_image = gr.Image(source='upload', type="pil", value="assets/demo1.jpg", tool="sketch")
-                task_type = gr.Dropdown(["scribble", "automask", "det", "seg", "inpainting", "automatic"],
-                                        value="automatic", label="task_type")
-                text_prompt = gr.Textbox(label="Text Prompt")
-                inpaint_prompt = gr.Textbox(label="Inpaint Prompt")
+
                 run_button = gr.Button(label="Run")
                 with gr.Accordion("Advanced options", open=False):
                     box_threshold = gr.Slider(
@@ -399,18 +306,15 @@ if __name__ == "__main__":
                     )
                     inpaint_mode = gr.Dropdown(["merge", "first"], value="merge", label="inpaint_mode")
                     scribble_mode = gr.Dropdown(["merge", "split"], value="split", label="scribble_mode")
-                    openai_api_key = gr.Textbox(label="(Optional)OpenAI key, enable chatgpt")
 
             with gr.Column():
                 gallery = gr.Gallery(
                     label="Generated images", show_label=False, elem_id="gallery"
                 ).style(preview=True, grid=2, object_fit="scale-down")
 
-                # openai_api_key = gr.Textbox(label="(Optional)OpenAI key, enable chatgpt")
-
         run_button.click(fn=run_grounded_sam, inputs=[
-            input_image, text_prompt, task_type, inpaint_prompt, box_threshold, text_threshold, iou_threshold,
-            inpaint_mode, scribble_mode, openai_api_key], outputs=[gallery, "text"])
+            input_image, box_threshold, text_threshold, iou_threshold
+        ], outputs=gallery)
 
     block.queue(concurrency_count=100)
     block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share)
